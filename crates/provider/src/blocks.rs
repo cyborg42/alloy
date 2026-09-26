@@ -118,26 +118,20 @@ impl<N: Network> NewBlocks<N> {
             debug!("client dropped");
             return None;
         };
-        let Some(pubsub) = client.pubsub_frontend() else {
-            error!("pubsub_frontend returned None after being Some");
-            return None;
-        };
-        let id = match client.request("eth_subscribe", ("newHeads",)).await {
-            Ok(id) => id,
-            Err(err) => {
-                error!(%err, "failed to subscribe to newHeads");
-                return None;
-            }
-        };
-        let sub = match pubsub.get_subscription(id).await {
-            Ok(sub) => sub,
-            Err(err) => {
-                error!(%err, "failed to get subscription");
-                return None;
-            }
-        };
-        let stream =
-            sub.into_typed::<N::HeaderResponse>().into_stream().map(|header| header.number());
+        // A typed subscription releases the upstream subscription once this stream is dropped,
+        // instead of pinning it with a legacy claim.
+        let call = client.request("eth_subscribe", ("newHeads",));
+        let sub =
+            match crate::GetSubscription::<_, N::HeaderResponse>::new(self.client.clone(), call)
+                .await
+            {
+                Ok(sub) => sub,
+                Err(err) => {
+                    error!(%err, "failed to subscribe to newHeads");
+                    return None;
+                }
+            };
+        let stream = sub.into_stream().map(|header| header.number());
         Some(self.into_block_stream(stream))
     }
 
@@ -272,6 +266,69 @@ mod regression_tests {
             tokio::time::timeout(Duration::from_secs(2), pending).await.unwrap().unwrap(),
             tx_hash
         );
+    }
+
+    #[cfg(feature = "ws-base")]
+    #[tokio::test]
+    async fn dropped_subscription_stream_releases_the_upstream_subscription() {
+        use futures::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (method_tx, mut method_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            loop {
+                tokio::select! {
+                    message = ws.next() => {
+                        let Some(Ok(message)) = message else { break };
+                        let Ok(text) = message.to_text() else { continue };
+                        let request: serde_json::Value = serde_json::from_str(text).unwrap();
+                        let method = request["method"].as_str().unwrap().to_owned();
+                        let result = match method.as_str() {
+                            "eth_subscribe" => serde_json::json!("0xabc"),
+                            "eth_unsubscribe" => serde_json::json!(true),
+                            _ => serde_json::Value::Null,
+                        };
+                        let response =
+                            serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                        ws.send(Message::Text(response.to_string().into())).await.unwrap();
+                        let _ = method_tx.send(method);
+                    }
+                    Some(()) = notify_rx.recv() => {
+                        let notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "eth_subscription",
+                            "params": {"subscription": "0xabc", "result": {}},
+                        });
+                        ws.send(Message::Text(notification.to_string().into())).await.unwrap();
+                    }
+                }
+            }
+        });
+
+        let provider = ProviderBuilder::new().connect(&format!("ws://{addr}")).await.unwrap();
+        let mut stream = Box::pin(NewBlocks::<Ethereum>::new(provider.weak_client()).into_stream());
+        // Polling starts the subscription; no header ever arrives, so this times out.
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+        assert_eq!(method_rx.recv().await.unwrap(), "eth_subscribe");
+        drop(stream);
+
+        // The next notification finds no receiver and releases the upstream subscription.
+        notify_tx.send(()).unwrap();
+        let method = tokio::time::timeout(Duration::from_secs(2), method_rx.recv())
+            .await
+            .expect("dropped heartbeat stream should unsubscribe")
+            .unwrap();
+        assert_eq!(method, "eth_unsubscribe");
+
+        drop(provider);
+        server.abort();
     }
 }
 
