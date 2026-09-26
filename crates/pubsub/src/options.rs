@@ -122,7 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retention_policy_default_matches_typed_option_a() {
+    fn retention_policy_default_is_while_receivers() {
         assert_eq!(
             SubscriptionRetentionPolicy::default(),
             SubscriptionRetentionPolicy::WhileReceivers
