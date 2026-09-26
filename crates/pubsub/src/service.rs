@@ -943,8 +943,19 @@ impl<T: PubSubConnect> PubSubService<T> {
 
                     item_opt = self.handle.from_socket.recv() => {
                         if let Some(item) = item_opt {
-                            if let Err(e) = self.handle_item(item) {
-                                break Err(e)
+                            if let Err(err) = self.handle_item(item) {
+                                // Cleanup or compensation dispatch can observe a backend that
+                                // closed while its last items were still buffered.
+                                if err
+                                    .as_transport_err()
+                                    .is_some_and(TransportErrorKind::is_backend_gone)
+                                {
+                                    if let Err(e) = self.reconnect_with_retries().await {
+                                        break Err(e)
+                                    }
+                                } else {
+                                    break Err(err)
+                                }
                             }
                         } else {
                             // The backend dropped its `to_frontend` sender.
@@ -2365,6 +2376,39 @@ mod tests {
 
         assert_eq!(reconnect_retry_interval(base, 1), Duration::from_secs(60));
         assert_eq!(reconnect_retry_interval(base, 2), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn backend_gone_during_buffered_cleanup_reconnects() {
+        let (old_handle, mut old_interface) = ConnectionHandle::new();
+        let (new_handle, mut new_interface) = ConnectionHandle::new();
+        let connector = MockConnect(Arc::new(Mutex::new(Some(new_handle))));
+        let (tx, reqs) = mpsc::unbounded_channel();
+        let mut service = PubSubService::new(old_handle, connector, reqs);
+        let (_alias, subscription) = activate_typed(
+            &mut service,
+            &mut old_interface,
+            eth_subscription(1, "newHeads"),
+            "old-server",
+            SubscriptionRetentionPolicy::WhileReceivers,
+        );
+        drop(subscription);
+
+        // The backend buffers one last notification for the now-unowned subscription and exits.
+        old_interface.send_to_frontend(notification("old-server", serde_json::json!(1))).unwrap();
+        old_interface.close_with_error();
+        service.spawn();
+
+        let request = Request::new("eth_chainId", Id::Number(2), ()).serialize().unwrap();
+        let expected = request.serialized().get().to_owned();
+        let (in_flight, _rx) = InFlight::new(request, 16);
+        tx.send(PubSubInstruction::Request(in_flight)).expect("service should still be running");
+
+        let dispatched = timeout(Duration::from_secs(1), new_interface.recv_from_frontend())
+            .await
+            .expect("request should be dispatched after reconnect")
+            .expect("new backend should receive the request");
+        assert_eq!(dispatched.get(), expected);
     }
 
     #[tokio::test]
