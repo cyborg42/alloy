@@ -110,6 +110,7 @@ async fn debug_trace_chain_subscription() -> Result<(), Box<dyn std::error::Erro
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let (unsubscribe_tx, unsubscribe_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -141,6 +142,16 @@ async fn debug_trace_chain_subscription() -> Result<(), Box<dyn std::error::Erro
             }
         });
         ws.send(Message::Text(notification.to_string().into())).await.unwrap();
+
+        let message = ws.next().await.unwrap().unwrap();
+        let request: serde_json::Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": true
+        });
+        unsubscribe_tx.send(request).unwrap();
+        ws.send(Message::Text(response.to_string().into())).await.unwrap();
         let _ = shutdown_rx.await;
     });
 
@@ -155,6 +166,12 @@ async fn debug_trace_chain_subscription() -> Result<(), Box<dyn std::error::Erro
 
     let result = subscription.recv().await?;
     assert_eq!(result.block, alloy_primitives::U256::from(2));
+
+    let outcome = provider.unsubscribe_and_wait(*subscription.local_id()).await?;
+    assert_eq!(outcome, alloy_pubsub::UnsubscribeOutcome::ServerConfirmed);
+    let unsubscribe = unsubscribe_rx.await?;
+    assert_eq!(unsubscribe["method"], "debug_unsubscribe");
+    assert_eq!(unsubscribe["params"], serde_json::json!(["0x1"]));
     let _ = shutdown_tx.send(());
     server.await?;
 
