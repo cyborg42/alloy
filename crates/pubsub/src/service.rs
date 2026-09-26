@@ -112,6 +112,9 @@ pub(crate) struct PubSubService<T> {
 
     /// Waiters for subscriptions whose protocol provides no cleanup method.
     connection_cleanup_waiters: BTreeMap<u64, Vec<CleanupWaiter>>,
+
+    /// Whether items from a replaced connection are being drained.
+    draining: bool,
 }
 
 impl<T: PubSubConnect> PubSubService<T> {
@@ -133,6 +136,7 @@ impl<T: PubSubConnect> PubSubService<T> {
             connection_epoch: 0,
             request_sequence: 0,
             connection_cleanup_waiters: BTreeMap::new(),
+            draining: false,
         }
     }
 
@@ -163,10 +167,18 @@ impl<T: PubSubConnect> PubSubService<T> {
 
         debug!("Draining old backend to_handle");
 
-        // Drain the old backend
+        // Drain the old backend. Its server IDs die with it, so cleanup requests raised while
+        // draining must not be sent to the replacement connection.
+        self.draining = true;
+        let mut drained = Ok(());
         while let Ok(item) = old_handle.from_socket.try_recv() {
-            self.handle_item(item)?;
+            if let Err(err) = self.handle_item(item) {
+                drained = Err(err);
+                break;
+            }
         }
+        self.draining = false;
+        drained?;
 
         old_handle.shutdown();
         self.finish_connection_epoch(old_epoch);
@@ -843,6 +855,11 @@ impl<T: PubSubConnect> PubSubService<T> {
         unsubscribe_method: Cow<'static, str>,
         waiters: Vec<CleanupWaiter>,
     ) -> TransportResult<()> {
+        if self.draining {
+            // Closing the replaced connection already reclaims its subscriptions.
+            Self::complete_cleanup_waiters(waiters, UnsubscribeOutcome::TransportClosed);
+            return Ok(());
+        }
         if let Some((_, cleanup)) =
             self.pending_cleanups.iter_mut().find(|(_, cleanup)| cleanup.server_id == server_id)
         {
@@ -2487,6 +2504,42 @@ mod tests {
 
         assert_eq!(reconnect_retry_interval(base, 1), Duration::from_secs(60));
         assert_eq!(reconnect_retry_interval(base, 2), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn draining_does_not_send_old_cleanup_to_the_new_connection() {
+        let (old_handle, mut old_interface) = ConnectionHandle::new();
+        let (new_handle, mut new_interface) = ConnectionHandle::new();
+        let connector = MockConnect(Arc::new(Mutex::new(Some(new_handle))));
+        let (_tx, reqs) = mpsc::unbounded_channel();
+        let mut service = PubSubService::new(old_handle, connector, reqs);
+
+        // An unowned subscription whose next notification is still buffered.
+        let (_alias, subscription) = activate_typed(
+            &mut service,
+            &mut old_interface,
+            eth_subscription(1, "newHeads"),
+            "old-unowned",
+            SubscriptionRetentionPolicy::WhileReceivers,
+        );
+        drop(subscription);
+        old_interface.send_to_frontend(notification("old-unowned", serde_json::json!(1))).unwrap();
+
+        // A subscription force-unsubscribed while starting whose late response is still buffered.
+        let request = eth_subscription(2, "logs");
+        let alias = subscription_local_id(&request);
+        let (in_flight, _response_rx) = InFlight::new(request, 16);
+        service.service_request(in_flight).unwrap();
+        let wire_id = take_wire_id(&mut old_interface);
+        let (tx, mut cleanup_rx) = oneshot::channel();
+        service.service_unsubscribe(alias, Some(tx)).unwrap();
+        old_interface.send_to_frontend(subscription_response(wire_id, "old-late").into()).unwrap();
+
+        service.reconnect().await.unwrap();
+        assert_no_wire(&mut new_interface);
+        assert!(service.pending_cleanups.is_empty());
+        assert!(service.subs.iter().next().is_none());
+        assert_eq!(cleanup_rx.try_recv().unwrap().unwrap(), UnsubscribeOutcome::TransportClosed);
     }
 
     #[tokio::test]
