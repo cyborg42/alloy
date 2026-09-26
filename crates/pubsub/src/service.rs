@@ -91,8 +91,11 @@ pub(crate) struct PubSubService<T> {
     /// Subscription requests that have been dispatched but are not active yet.
     starting: BTreeMap<B256, StartingSubscription>,
 
-    /// Every subscribe request ID remains routed until its connection closes so duplicate or late
-    /// successful responses can be compensated with an unsubscribe.
+    /// Subscribe requests awaiting their response, keyed by service-owned wire request ID.
+    ///
+    /// A route stays until its response arrives, even after every waiter is gone, so a late
+    /// successful response can be compensated with an unsubscribe. Service-owned IDs keep caller
+    /// IDs, which may repeat across clients or retries, from ever matching a route.
     subscribe_routes: BTreeMap<Id, SubscribeRoute>,
 
     /// Active keys currently awaiting a resubscribe response.
@@ -372,9 +375,15 @@ impl<T: PubSubConnect> PubSubService<T> {
         in_flight: InFlight,
         unsubscribe_method: Option<Cow<'static, str>>,
     ) -> TransportResult<()> {
-        let wire_request_id = in_flight.request.id().clone();
+        let wire_request_id = self.next_service_id();
+        let message = match in_flight.request.with_id(wire_request_id.clone()) {
+            Ok(request) => request.into_serialized(),
+            Err(error) => {
+                let _ = in_flight.tx.send(Err(RpcError::ser_err(error)));
+                return Ok(());
+            }
+        };
         let request = in_flight.request.clone();
-        let message = request.serialized().to_owned();
         let channel_size = in_flight.channel_size;
         self.starting.insert(
             local_id,
@@ -612,23 +621,34 @@ impl<T: PubSubConnect> PubSubService<T> {
     }
 
     /// Route a subscribe or resubscribe response without ever overwriting an active server ID.
+    ///
+    /// The route is released here because a server answers each request ID once.
     fn handle_sub_response(&mut self, response: Response) -> TransportResult<()> {
-        let route = self.subscribe_routes.get(&response.id).expect("checked by caller");
-        let local_id = route.local_id;
-        let unsubscribe_method = route.unsubscribe_method.clone();
+        let SubscribeRoute { local_id, unsubscribe_method, cleanup_waiters, .. } =
+            self.subscribe_routes.remove(&response.id).expect("checked by caller");
 
         match response.payload {
             ResponsePayload::Success(value) => match serde_json::from_str::<SubId>(value.get()) {
-                Ok(server_id) => {
-                    self.handle_sub_success(response.id, local_id, unsubscribe_method, server_id)
-                }
+                Ok(server_id) => self.handle_sub_success(
+                    response.id,
+                    local_id,
+                    unsubscribe_method,
+                    server_id,
+                    cleanup_waiters,
+                ),
                 Err(error) => {
-                    self.handle_invalid_sub_response(response.id, local_id, value.get(), error);
+                    self.handle_invalid_sub_response(
+                        response.id,
+                        local_id,
+                        value.get(),
+                        error,
+                        cleanup_waiters,
+                    );
                     Ok(())
                 }
             },
             ResponsePayload::Failure(error) => {
-                self.handle_sub_failure(response.id, local_id, error);
+                self.handle_sub_failure(response.id, local_id, error, cleanup_waiters);
                 Ok(())
             }
         }
@@ -640,7 +660,10 @@ impl<T: PubSubConnect> PubSubService<T> {
         local_id: B256,
         unsubscribe_method: Option<Cow<'static, str>>,
         server_id: SubId,
+        cleanup_waiters: Vec<CleanupWaiter>,
     ) -> TransportResult<()> {
+        // Cleanup waiters join a route only after `service_unsubscribe` removed its `starting` or
+        // `reconnecting` entry, so they are always empty on the paths that activate the response.
         let is_expected_start = self
             .starting
             .get(&local_id)
@@ -649,7 +672,11 @@ impl<T: PubSubConnect> PubSubService<T> {
             let mut starting = self.starting.remove(&local_id).expect("checked above");
             starting.waiters.retain(InFlight::is_live_subscription_waiter);
             if starting.waiters.is_empty() || self.subs.get(&local_id).is_some() {
-                return self.compensate_subscription(response_id, server_id, unsubscribe_method);
+                return self.compensate_subscription(
+                    server_id,
+                    unsubscribe_method,
+                    cleanup_waiters,
+                );
             }
             if self.subs.contains_server_id(&server_id) {
                 warn!(?server_id, ?local_id, "subscription response reused a live server id");
@@ -680,7 +707,7 @@ impl<T: PubSubConnect> PubSubService<T> {
                 self.subs.insert(active, server_id);
             } else {
                 drop(active);
-                self.compensate_subscription(response_id, server_id, unsubscribe_method)?;
+                self.compensate_subscription(server_id, unsubscribe_method, cleanup_waiters)?;
             }
             return Ok(());
         }
@@ -691,7 +718,11 @@ impl<T: PubSubConnect> PubSubService<T> {
             self.reconnecting.remove(&local_id);
             if self.subs.get(&local_id).is_some_and(ActiveSubscription::should_auto_cleanup) {
                 self.subs.remove_sub(local_id);
-                return self.compensate_subscription(response_id, server_id, unsubscribe_method);
+                return self.compensate_subscription(
+                    server_id,
+                    unsubscribe_method,
+                    cleanup_waiters,
+                );
             }
             if self.subs.set_server_id(&local_id, server_id.clone()) {
                 return Ok(());
@@ -699,7 +730,7 @@ impl<T: PubSubConnect> PubSubService<T> {
             self.subs.remove_sub(local_id);
         }
 
-        self.compensate_subscription(response_id, server_id, unsubscribe_method)
+        self.compensate_subscription(server_id, unsubscribe_method, cleanup_waiters)
     }
 
     fn handle_invalid_sub_response(
@@ -708,6 +739,7 @@ impl<T: PubSubConnect> PubSubService<T> {
         local_id: B256,
         value: &str,
         error: serde_json::Error,
+        cleanup_waiters: Vec<CleanupWaiter>,
     ) {
         warn!(?local_id, %error, "invalid subscription response");
         let is_expected_start = self
@@ -732,11 +764,9 @@ impl<T: PubSubConnect> PubSubService<T> {
             self.subs.remove_sub(local_id);
         }
 
-        if let Some(route) = self.subscribe_routes.get_mut(&response_id) {
-            for waiter in std::mem::take(&mut route.cleanup_waiters) {
-                let error = serde_json::from_str::<SubId>(value).unwrap_err();
-                let _ = waiter.send(Err(alloy_transport::TransportError::deser_err(error, value)));
-            }
+        for waiter in cleanup_waiters {
+            let error = serde_json::from_str::<SubId>(value).unwrap_err();
+            let _ = waiter.send(Err(alloy_transport::TransportError::deser_err(error, value)));
         }
     }
 
@@ -745,6 +775,7 @@ impl<T: PubSubConnect> PubSubService<T> {
         response_id: Id,
         local_id: B256,
         error: alloy_json_rpc::ErrorPayload,
+        cleanup_waiters: Vec<CleanupWaiter>,
     ) {
         let is_expected_start = self
             .starting
@@ -770,26 +801,16 @@ impl<T: PubSubConnect> PubSubService<T> {
             warn!(?local_id, %error, "failed to restore subscription after reconnect");
         }
 
-        if let Some(route) = self.subscribe_routes.get_mut(&response_id) {
-            Self::complete_cleanup_waiters(
-                std::mem::take(&mut route.cleanup_waiters),
-                UnsubscribeOutcome::AlreadyAbsent,
-            );
-        }
+        Self::complete_cleanup_waiters(cleanup_waiters, UnsubscribeOutcome::AlreadyAbsent);
     }
 
     fn compensate_subscription(
         &mut self,
-        response_id: Id,
         server_id: SubId,
         unsubscribe_method: Option<Cow<'static, str>>,
+        waiters: Vec<CleanupWaiter>,
     ) -> TransportResult<()> {
         if self.subs.contains_server_id(&server_id) {
-            let waiters = self
-                .subscribe_routes
-                .get_mut(&response_id)
-                .map(|route| std::mem::take(&mut route.cleanup_waiters))
-                .unwrap_or_default();
             warn!(?server_id, "refusing to clean up a server id held by a live subscription");
             for waiter in waiters {
                 let _ = waiter.send(Err(RpcError::local_usage_str(
@@ -800,13 +821,9 @@ impl<T: PubSubConnect> PubSubService<T> {
         }
         let Some(unsubscribe_method) = unsubscribe_method else {
             warn!(?server_id, "unclaimed subscription has no cleanup method; it will remain until connection close");
+            self.defer_cleanup_until_connection_close(waiters);
             return Ok(());
         };
-        let waiters = self
-            .subscribe_routes
-            .get_mut(&response_id)
-            .map(|route| std::mem::take(&mut route.cleanup_waiters))
-            .unwrap_or_default();
         warn!(?server_id, "cleaning up an unclaimed subscription response");
         self.start_cleanup(server_id, unsubscribe_method, waiters)
     }
@@ -1173,6 +1190,14 @@ mod tests {
         serde_json::from_str(request.get()).unwrap()
     }
 
+    fn take_wire_id(interface: &mut ConnectionInterface) -> Id {
+        wire_id(&take_wire(interface))
+    }
+
+    fn wire_id(wire: &serde_json::Value) -> Id {
+        serde_json::from_value(wire["id"].clone()).unwrap()
+    }
+
     fn assert_no_wire(interface: &mut ConnectionInterface) {
         assert!(matches!(
             interface.from_frontend.try_recv(),
@@ -1197,8 +1222,8 @@ mod tests {
         let request_id = request.id().clone();
         let (in_flight, mut rx) = InFlight::new(request, 16);
         service.service_request(in_flight).unwrap();
-        let _ = take_wire(interface);
-        service.handle_item(subscription_response(request_id.clone(), server_id).into()).unwrap();
+        let wire_id = take_wire_id(interface);
+        service.handle_item(subscription_response(wire_id, server_id).into()).unwrap();
         let response = rx.try_recv().unwrap().unwrap();
         alias_from_response(response, request_id)
     }
@@ -1214,8 +1239,8 @@ mod tests {
         let (in_flight, mut response_rx, mut subscription_rx) =
             typed_in_flight(request, retention_policy);
         service.service_request(in_flight).unwrap();
-        let _ = take_wire(interface);
-        service.handle_item(subscription_response(request_id.clone(), server_id).into()).unwrap();
+        let wire_id = take_wire_id(interface);
+        service.handle_item(subscription_response(wire_id, server_id).into()).unwrap();
         let alias = alias_from_response(response_rx.try_recv().unwrap().unwrap(), request_id);
         let subscription = subscription_rx.try_recv().unwrap();
         assert_eq!(&alias, subscription.local_id());
@@ -1263,11 +1288,11 @@ mod tests {
 
         service.service_request(first).unwrap();
         let wire = take_wire(&mut interface);
-        assert_eq!(wire["id"], 1);
+        assert!(wire["id"].as_str().unwrap().starts_with("alloy-pubsub:"));
         service.service_request(second).unwrap();
         assert_no_wire(&mut interface);
 
-        service.handle_item(subscription_response(Id::Number(1), "server-1").into()).unwrap();
+        service.handle_item(subscription_response(wire_id(&wire), "server-1").into()).unwrap();
         let first_alias = alias_from_response(first_rx.try_recv().unwrap().unwrap(), Id::Number(1));
         let second_alias =
             alias_from_response(second_rx.try_recv().unwrap().unwrap(), Id::Number(2));
@@ -1295,8 +1320,8 @@ mod tests {
         let (in_flight, mut response_rx, mut subscription_rx) =
             typed_in_flight(request, SubscriptionRetentionPolicy::WhileReceivers);
         service.service_request(in_flight).unwrap();
-        let _ = take_wire(&mut interface);
-        service.handle_item(subscription_response(Id::Number(1), "typed").into()).unwrap();
+        let wire_id = take_wire_id(&mut interface);
+        service.handle_item(subscription_response(wire_id, "typed").into()).unwrap();
 
         let active = service.subs.get(&local_id).unwrap();
         assert_eq!(active.receiver_count(), 1);
@@ -1347,8 +1372,8 @@ mod tests {
             SubscriptionRetentionPolicy::WhileReceivers,
         );
         service.service_request(in_flight).unwrap();
-        let _ = take_wire(&mut interface);
-        service.handle_item(subscription_response(Id::Number(1), "typed").into()).unwrap();
+        let wire_id = take_wire_id(&mut interface);
+        service.handle_item(subscription_response(wire_id, "typed").into()).unwrap();
         let _ = response_rx.try_recv().unwrap().unwrap();
         drop(subscription_rx);
 
@@ -1433,9 +1458,9 @@ mod tests {
         assert_eq!(cleanup["method"], "eth_unsubscribe");
         assert_eq!(cleanup["params"], serde_json::json!(["old"]));
         assert_eq!(subscribe["method"], "eth_subscribe");
-        assert_eq!(subscribe["id"], 2);
+        assert!(subscribe["id"].as_str().unwrap().starts_with("alloy-pubsub:"));
 
-        service.handle_item(subscription_response(Id::Number(2), "new").into()).unwrap();
+        service.handle_item(subscription_response(wire_id(&subscribe), "new").into()).unwrap();
         let new_alias =
             alias_from_response(response_rx.try_recv().unwrap().unwrap(), Id::Number(2));
         let new = subscription_rx.try_recv().unwrap();
@@ -1502,9 +1527,8 @@ mod tests {
                 service.service_request(typed).unwrap();
             }
             let wire = take_wire(&mut interface);
-            let wire_id = if typed_first { Id::Number(1) } else { Id::Number(2) };
-            assert_eq!(wire["id"], serde_json::json!(if typed_first { 1 } else { 2 }));
-            service.handle_item(subscription_response(wire_id, "mixed").into()).unwrap();
+            assert!(wire["id"].as_str().unwrap().starts_with("alloy-pubsub:"));
+            service.handle_item(subscription_response(wire_id(&wire), "mixed").into()).unwrap();
             let typed_alias =
                 alias_from_response(typed_response.try_recv().unwrap().unwrap(), Id::Number(1));
             let legacy_alias =
@@ -1533,11 +1557,11 @@ mod tests {
         );
         let (legacy, legacy_response) = InFlight::new(eth_subscription(2, "newHeads"), 16);
         service.service_request(typed).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
         service.service_request(legacy).unwrap();
         drop(legacy_response);
 
-        service.handle_item(subscription_response(Id::Number(1), "typed").into()).unwrap();
+        service.handle_item(subscription_response(wire_id, "typed").into()).unwrap();
         let alias = alias_from_response(typed_response.try_recv().unwrap().unwrap(), Id::Number(1));
         let typed_subscription = typed_subscription.try_recv().unwrap();
         assert!(!service.subs.get(&alias).unwrap().has_persistent_hold());
@@ -1761,10 +1785,10 @@ mod tests {
         let (mut service, mut interface) = test_service();
         let (in_flight, rx) = InFlight::new(eth_subscription(1, "logs"), 16);
         service.service_request(in_flight).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
         drop(rx);
 
-        service.handle_item(subscription_response(Id::Number(1), "abandoned").into()).unwrap();
+        service.handle_item(subscription_response(wire_id, "abandoned").into()).unwrap();
         assert_eq!(service.subs.len(), 0);
         let cleanup = take_wire(&mut interface);
         assert_eq!(cleanup["method"], "eth_unsubscribe");
@@ -1777,11 +1801,11 @@ mod tests {
         let (first, first_rx) = InFlight::new(eth_subscription(1, "logs"), 16);
         let (second, mut second_rx) = InFlight::new(eth_subscription(2, "logs"), 16);
         service.service_request(first).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
         service.service_request(second).unwrap();
         drop(first_rx);
 
-        service.handle_item(subscription_response(Id::Number(1), "shared").into()).unwrap();
+        service.handle_item(subscription_response(wire_id, "shared").into()).unwrap();
         let _ = alias_from_response(second_rx.try_recv().unwrap().unwrap(), Id::Number(2));
         assert_eq!(service.subs.len(), 1);
         assert_no_wire(&mut interface);
@@ -1792,14 +1816,14 @@ mod tests {
         let (mut service, mut interface) = test_service();
         let (first, first_rx) = InFlight::new(eth_subscription(1, "logs"), 16);
         service.service_request(first).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
         drop(first_rx);
 
         let (second, mut second_rx) = InFlight::new(eth_subscription(2, "logs"), 16);
         service.service_request(second).unwrap();
         assert_no_wire(&mut interface);
 
-        service.handle_item(subscription_response(Id::Number(1), "shared").into()).unwrap();
+        service.handle_item(subscription_response(wire_id, "shared").into()).unwrap();
         let _ = alias_from_response(second_rx.try_recv().unwrap().unwrap(), Id::Number(2));
         assert_eq!(service.subs.len(), 1);
         assert_no_wire(&mut interface);
@@ -1822,10 +1846,10 @@ mod tests {
         let (first, mut first_rx) = InFlight::new(eth_subscription(1, "logs"), 16);
         let (second, mut second_rx) = InFlight::new(eth_subscription(2, "logs"), 16);
         service.service_request(first).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
         service.service_request(second).unwrap();
 
-        service.handle_item(Response::internal_error(Id::Number(1)).into()).unwrap();
+        service.handle_item(Response::internal_error(wire_id).into()).unwrap();
         let first = first_rx.try_recv().unwrap().unwrap();
         let second = second_rx.try_recv().unwrap().unwrap();
         assert_eq!(first.id, Id::Number(1));
@@ -1834,6 +1858,93 @@ mod tests {
         assert!(second.is_error());
         assert!(service.starting.is_empty());
         assert_eq!(service.subs.len(), 0);
+    }
+
+    #[test]
+    fn retry_with_same_caller_id_after_failure_starts_a_new_subscription() {
+        let (mut service, mut interface) = test_service();
+        let request = eth_subscription(5, "newHeads");
+        let (first, mut first_rx) = InFlight::new(request.clone(), 16);
+        service.service_request(first).unwrap();
+        let first_wire_id = take_wire_id(&mut interface);
+        let rate_limited = Response {
+            id: first_wire_id.clone(),
+            payload: ResponsePayload::Failure(alloy_json_rpc::ErrorPayload {
+                code: 429,
+                message: "rate limited".into(),
+                data: None,
+            }),
+        };
+        service.handle_item(rate_limited.into()).unwrap();
+        assert!(first_rx.try_recv().unwrap().unwrap().is_error());
+        assert!(service.subscribe_routes.is_empty());
+
+        // `RetryBackoffService` replays the identical request, caller ID included.
+        let (retry, mut retry_rx) = InFlight::new(request, 16);
+        service.service_request(retry).unwrap();
+        let retry_wire_id = take_wire_id(&mut interface);
+        assert_ne!(retry_wire_id, first_wire_id);
+        service.handle_item(subscription_response(retry_wire_id, "retried").into()).unwrap();
+        let _ = alias_from_response(retry_rx.try_recv().unwrap().unwrap(), Id::Number(5));
+        assert_eq!(service.subs.len(), 1);
+    }
+
+    #[test]
+    fn normal_request_reusing_a_subscription_caller_id_is_not_hijacked() {
+        let (mut service, mut interface) = test_service();
+        let _ = activate(&mut service, &mut interface, eth_subscription(1, "newHeads"), "active");
+
+        // A second client sharing the frontend numbers its requests from the same start.
+        let normal = Request::new("eth_blockNumber", Id::Number(1), ()).serialize().unwrap();
+        let (normal, mut normal_rx) = InFlight::new(normal, 16);
+        service.service_request(normal).unwrap();
+        let _ = take_wire(&mut interface);
+        let response = Response {
+            id: Id::Number(1),
+            payload: ResponsePayload::Success(to_json_raw_value(&"0x10").unwrap()),
+        };
+        service.handle_item(response.into()).unwrap();
+
+        assert_eq!(normal_rx.try_recv().unwrap().unwrap().id, Id::Number(1));
+        assert_no_wire(&mut interface);
+    }
+
+    #[test]
+    fn subscribe_routes_are_released_after_each_response() {
+        let (mut service, mut interface) = test_service();
+        for index in 0..3u64 {
+            let request = Request::new("eth_subscribe", Id::Number(index), ("logs", index))
+                .serialize()
+                .unwrap();
+            let alias = activate(&mut service, &mut interface, request, &format!("server-{index}"));
+            service.service_unsubscribe(alias, None).unwrap();
+            let cleanup_id = take_wire_id(&mut interface);
+            service.handle_item(bool_response(cleanup_id, true).into()).unwrap();
+        }
+        assert!(service.subscribe_routes.is_empty());
+        assert!(service.pending_cleanups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_response_without_cleanup_method_keeps_waiter_until_connection_close() {
+        let (old_handle, mut old_interface) = ConnectionHandle::new();
+        let (new_handle, _new_interface) = ConnectionHandle::new();
+        let connector = MockConnect(Arc::new(Mutex::new(Some(new_handle))));
+        let (_tx, reqs) = mpsc::unbounded_channel();
+        let mut service = PubSubService::new(old_handle, connector, reqs);
+        let request = custom_subscription(1, "custom_events", None);
+        let alias = subscription_local_id(&request);
+        let (in_flight, _response_rx) = InFlight::new(request, 16);
+        service.service_request(in_flight).unwrap();
+        let wire_id = take_wire_id(&mut old_interface);
+
+        let (tx, mut cleanup_rx) = oneshot::channel();
+        service.service_unsubscribe(alias, Some(tx)).unwrap();
+        service.handle_item(subscription_response(wire_id, "late").into()).unwrap();
+        assert!(matches!(cleanup_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+
+        service.reconnect().await.unwrap();
+        assert_eq!(cleanup_rx.try_recv().unwrap().unwrap(), UnsubscribeOutcome::TransportClosed);
     }
 
     #[test]
@@ -1851,21 +1962,21 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_server_response_is_cleaned_without_overwriting_active_id() {
+    fn duplicate_server_response_is_ignored_without_overwriting_active_id() {
         let (mut service, mut interface) = test_service();
-        let alias =
-            activate(&mut service, &mut interface, eth_subscription(1, "newHeads"), "active");
+        let (in_flight, mut rx) = InFlight::new(eth_subscription(1, "newHeads"), 16);
+        service.service_request(in_flight).unwrap();
+        let wire_id = take_wire_id(&mut interface);
+        service.handle_item(subscription_response(wire_id.clone(), "active").into()).unwrap();
+        let alias = alias_from_response(rx.try_recv().unwrap().unwrap(), Id::Number(1));
+        assert!(service.subscribe_routes.is_empty());
 
-        service.handle_item(subscription_response(Id::Number(1), "duplicate").into()).unwrap();
-        let cleanup = take_wire(&mut interface);
-        assert_eq!(cleanup["params"], serde_json::json!(["duplicate"]));
+        service.handle_item(subscription_response(wire_id, "duplicate").into()).unwrap();
+        assert_no_wire(&mut interface);
         assert_eq!(
             service.subs.server_id_for_local_id(&alias),
             Some(&SubId::String("active".into()))
         );
-
-        service.handle_item(subscription_response(Id::Number(1), "active").into()).unwrap();
-        assert_no_wire(&mut interface);
     }
 
     #[test]
@@ -1877,10 +1988,10 @@ mod tests {
         let (first, mut first_rx) = InFlight::new(first_request, 16);
         let (second, mut second_rx) = InFlight::new(second_request, 16);
         service.service_request(first).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
         service.service_request(second).unwrap();
         assert_no_wire(&mut interface);
-        service.handle_item(subscription_response(Id::Number(1), "sized").into()).unwrap();
+        service.handle_item(subscription_response(wire_id, "sized").into()).unwrap();
         first_rx.try_recv().unwrap().unwrap();
         second_rx.try_recv().unwrap().unwrap();
         assert_eq!(service.subs.get(&local_id).unwrap().channel_size, 7);
@@ -2037,14 +2148,14 @@ mod tests {
         let alias = subscription_local_id(&request);
         let (in_flight, mut response_rx) = InFlight::new(request, 16);
         service.service_request(in_flight).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
 
         let (tx, mut cleanup_rx) = oneshot::channel();
         service.service_unsubscribe(alias, Some(tx)).unwrap();
         assert!(response_rx.try_recv().unwrap().unwrap_err().is_local_usage_error());
         assert_no_wire(&mut interface);
 
-        service.handle_item(subscription_response(Id::Number(1), "late").into()).unwrap();
+        service.handle_item(subscription_response(wire_id, "late").into()).unwrap();
         let cleanup = take_wire(&mut interface);
         assert_eq!(cleanup["params"], serde_json::json!(["late"]));
         let cleanup_id = Id::String(cleanup["id"].as_str().unwrap().to_owned());
@@ -2060,12 +2171,12 @@ mod tests {
         let alias = subscription_local_id(&request);
         let (in_flight, _response_rx) = InFlight::new(request, 16);
         service.service_request(in_flight).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
 
         let (tx, mut cleanup_rx) = oneshot::channel();
         service.service_unsubscribe(alias, Some(tx)).unwrap();
         let invalid = Response {
-            id: Id::Number(1),
+            id: wire_id,
             payload: ResponsePayload::Success(to_json_raw_value(&true).unwrap()),
         };
         service.handle_item(invalid.into()).unwrap();
@@ -2133,9 +2244,9 @@ mod tests {
         let (second, mut second_rx) =
             InFlight::new(custom_subscription(2, "custom_events", Some("custom_unsubscribeB")), 16);
         service.service_request(first).unwrap();
-        let _ = take_wire(&mut interface);
+        let wire_id = take_wire_id(&mut interface);
         service.service_request(second).unwrap();
-        service.handle_item(subscription_response(Id::Number(1), "custom").into()).unwrap();
+        service.handle_item(subscription_response(wire_id, "custom").into()).unwrap();
         let alias = alias_from_response(first_rx.try_recv().unwrap().unwrap(), Id::Number(1));
         let second_alias =
             alias_from_response(second_rx.try_recv().unwrap().unwrap(), Id::Number(2));

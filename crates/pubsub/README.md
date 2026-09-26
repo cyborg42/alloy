@@ -126,8 +126,10 @@ The **service** intercepts the RPC response, which must deserialize as an
 [`alloy_json_rpc::SubId`] (a numeric or string ID). Other response types will fail
 deserialization.
 
-The service reserves string request IDs beginning with `alloy-pubsub:` for resubscribe and cleanup
-traffic. Manually constructed requests must not use that prefix.
+The service reserves string request IDs beginning with `alloy-pubsub:` for all subscribe,
+resubscribe, and cleanup traffic it puts on the wire. Caller request IDs never reach the server for
+subscription requests, so they may repeat across clients sharing a frontend or across retries.
+Manually constructed requests must not use that prefix.
 
 `PubSubFrontend::unsubscribe()` retains its enqueue-only behavior. Use
 `PubSubFrontend::unsubscribe_and_wait()` when the caller needs to observe server confirmation,
@@ -174,7 +176,7 @@ Subscription Request Lifecycle:
 1. The **frontend** sends the request to the **service**, with a oneshot channel
    to receive the response.
 1. The **service** joins the request to an existing matching single-flight, or creates one and sends
-   a single request to the **backend**.
+   a single request to the **backend** under a service-owned request ID.
 1. The **backend** sends the request to the RPC server.
 1. The RPC server responds with a numeric or string `server_id`.
 1. The **backend** sends the response to the **service**.
